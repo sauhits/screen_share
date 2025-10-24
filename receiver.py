@@ -14,6 +14,7 @@ HOST = '0.0.0.0'
 PORT = int(os.getenv('PORT', 9999))
 BUFFER_SIZE = 65536
 SECRET_KEY = os.getenv('SECRET_KEY').encode()
+END_STREAM_MSG = b'--STREAM_END--' # 終了通知メッセージ
 
 def main():
     cipher = Fernet(SECRET_KEY)
@@ -27,8 +28,15 @@ def main():
 
         while True:
             try:
-                # 1. チャンク受信と再構築
-                data, _ = sock.recvfrom(BUFFER_SIZE)
+                data, _ = sock.recvfrom(BUFFER_SıZE)
+
+                # --- ★ 修正点：終了通知をチェック ---
+                if data == END_STREAM_MSG:
+                    print("送信側が終了しました。受信を停止します。")
+                    break # ループを抜けて終了
+                # ------------------------------------
+
+                # 1. チャンク受信と再構築 (通常の処理)
                 header = data[:16]
                 chunk_data = data[16:]
                 frame_id, total_chunks, chunk_id = struct.unpack('QII', header)
@@ -43,7 +51,7 @@ def main():
                     buffers[frame_id][chunk_id] = chunk_data
                 
                 # 2. 全チャンクが揃ったら処理
-                if frame_id in buffers and all(c is not in None for c in buffers[frame_id]):
+                if frame_id in buffers and all(c is not None for c in buffers[frame_id]):
                     full_encrypted_data = b''.join(buffers[frame_id])
                     del buffers[frame_id]
 
@@ -63,7 +71,7 @@ def main():
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
-            except Exception as e:
+            except Exception:
                 pass
 
     cv2.destroyAllWindows()
