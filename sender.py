@@ -1,9 +1,7 @@
-# sender.py
+# receiver.py
 import cv2
-import mss
 import numpy as np
 import socket
-import time
 import struct
 from cryptography.fernet import Fernet
 import os
@@ -12,12 +10,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- 設定項目 ---
-HOST = os.getenv('HOST', '192.168.0.5')
+HOST = '0.0.0.0'
 PORT = int(os.getenv('PORT', 9999))
-JPEG_QUALITY = int(os.getenv('JPEG_QUALITY', 60))
-MAX_CHUNK_SIZE = 60000
-KEYFRAME_INTERVAL = 5
-TARGET_FPS = 30
+BUFFER_SIZE = 65536
 SECRET_KEY = os.getenv('SECRET_KEY').encode()
 
 # --- Packet Types ---
@@ -26,79 +21,73 @@ TYPE_DIFF = 1
 
 def main():
     cipher = Fernet(SECRET_KEY)
-    
+
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        with mss.mss() as sct:
-            monitor = sct.monitors[1]
-            print(f"キャプチャ対象: {monitor['width']}x{monitor['height']}")
-            print(f"{HOST}:{PORT} へ差分エンコードでの送信を開始します。")
+        sock.bind((HOST, PORT))
+        print(f"{HOST}:{PORT} で差分データを受信待機中...")
+        
+        buffers = {}
+        current_screen = None
 
-            frame_id = 0
-            previous_frame = None
-            last_keyframe_time = 0
-            
-            while True:
-                try:
-                    now = time.time()
-                    img_mss = sct.grab(monitor)
-                    current_frame = cv2.cvtColor(np.array(img_mss), cv2.COLOR_BGRA2BGR)
-                    
-                    payload = b''
-                    
-                    # --- ★ 修正点 ★ ---
-                    # キーフレームを送信するか、差分を送信するかを決定
-                    is_keyframe_time = (now - last_keyframe_time) > KEYFRAME_INTERVAL
-                    
-                    if previous_frame is None or is_keyframe_time:
-                        # 全画面（キーフレーム）を送信
-                        print(">>> Sending KEYFRAME (full update)") # ★デバッグ表示を追加
-                        ret, jpeg_data = cv2.imencode('.jpg', current_frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-                        if not ret: continue
-                        payload = struct.pack('>B', TYPE_KEYFRAME) + jpeg_data.tobytes()
-                        last_keyframe_time = now
-                    else:
-                        # 差分を送信
-                        diff = cv2.absdiff(current_frame, previous_frame)
-                        is_changed = np.any(diff > 15, axis=2)
-                        
-                        changed_y, changed_x = np.where(is_changed)
-                        
-                        if len(changed_y) == 0:
-                            time.sleep(1 / TARGET_FPS)
-                            continue
-                        
-                        x, y = np.min(changed_x), np.min(changed_y)
-                        w, h = np.max(changed_x) - x + 1, np.max(changed_y) - y + 1
-                        
-                        cropped_diff = current_frame[y:y+h, x:x+w]
-                        
-                        ret, jpeg_data = cv2.imencode('.jpg', cropped_diff, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-                        if not ret: continue
-                        
-                        header = struct.pack('>BHH', TYPE_DIFF, x, y)
-                        payload = header + jpeg_data.tobytes()
+        while True:
+            try:
+                data, _ = sock.recvfrom(BUFFER_SIZE)
+                header = data[:16]
+                chunk_data = data[16:]
+                frame_id, total_chunks, chunk_id = struct.unpack('QII', header)
 
-                    # 送信処理
-                    encrypted_data = cipher.encrypt(payload)
-                    data_size = len(encrypted_data)
-                    total_chunks = (data_size // MAX_CHUNK_SIZE) + 1
+                # --- ★ 修正点：バッファ管理を強化 ---
+                # 新しいフレームIDの最初のチャンクが来たら、古いバッファを掃除する
+                if frame_id not in buffers:
+                    # 5フレーム以上前の古いバッファはすべて削除
+                    frames_to_delete = [fid for fid in buffers if fid < frame_id - 5]
+                    for fid in frames_to_delete:
+                        del buffers[fid]
                     
-                    for i in range(total_chunks):
-                        start = i * MAX_CHUNK_SIZE
-                        end = start + MAX_CHUNK_SIZE
-                        header = struct.pack('QII', frame_id, total_chunks, i)
-                        sock.sendto(header + encrypted_data[start:end], (HOST, PORT))
+                    buffers[frame_id] = [None] * total_chunks
 
-                    previous_frame = current_frame
-                    frame_id = (frame_id + 1) % 1000000
+                if frame_id in buffers:
+                    buffers[frame_id][chunk_id] = chunk_data
+                
+                # 全チャンクが揃ったら処理
+                if frame_id in buffers and all(c is not None for c in buffers[frame_id]):
+                    full_encrypted_data = b''.join(buffers[frame_id])
+                    del buffers[frame_id]
+
+                    try:
+                        payload = cipher.decrypt(full_encrypted_data)
+                    except Exception:
+                        continue
                     
-                    time.sleep(1 / TARGET_FPS)
+                    packet_type = struct.unpack('>B', payload[:1])[0]
 
-                except KeyboardInterrupt:
-                    print("\n送信を停止しました。")
+                    if packet_type == TYPE_KEYFRAME:
+                        jpeg_data = payload[1:]
+                        img_np = np.frombuffer(jpeg_data, dtype=np.uint8)
+                        current_screen = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+
+                    elif packet_type == TYPE_DIFF and current_screen is not None:
+                        header = payload[1:5]
+                        x, y = struct.unpack('>HH', header)
+                        jpeg_data = payload[5:]
+                        
+                        img_np = np.frombuffer(jpeg_data, dtype=np.uint8)
+                        patch = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+                        
+                        if patch is not None:
+                            h, w, _ = patch.shape
+                            if y + h <= current_screen.shape[0] and x + w <= current_screen.shape[1]:
+                                current_screen[y:y+h, x:x+w] = patch
+                
+                if current_screen is not None:
+                    cv2.imshow("Receiver", current_screen)
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
-                except Exception as e:
-                    pass
+            except Exception as e:
+                pass
+
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
