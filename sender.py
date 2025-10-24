@@ -6,57 +6,98 @@ import socket
 import time
 import struct
 from cryptography.fernet import Fernet
-from dotenv import load_dotenv
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --- 設定項目 ---
-HOST = '192.168.0.5' # 送信先のIPアドレス
-PORT = 9999
-JPEG_QUALITY = 50
+HOST = os.getenv('HOST', '192.168.0.5')
+PORT = int(os.getenv('PORT', 9999))
+JPEG_QUALITY = int(os.getenv('JPEG_QUALITY', 60))
 MAX_CHUNK_SIZE = 60000
+KEYFRAME_INTERVAL = 5
+SECRET_KEY = os.getenv('SECRET_KEY').encode()
 
-# ステップ2で生成した秘密鍵をここに貼り付けてください
-load_dotenv()
-SECRET_KEY = os.getenv('SECRET_KEY')
+# --- Packet Types ---
+TYPE_KEYFRAME = 0
+TYPE_DIFF = 1
+# --------------------
 
 def main():
-    # --- 暗号化関連 ---
-    cipher = Fernet(SECRET_KEY) 
-
+    cipher = Fernet(SECRET_KEY)
+    
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         with mss.mss() as sct:
             monitor = sct.monitors[1]
             print(f"キャプチャ対象: {monitor['width']}x{monitor['height']}")
-            print(f"{HOST}:{PORT} へ暗号化通信を開始します。Ctrl+Cで停止します。")
-            
+            print(f"{HOST}:{PORT} へ差分エンコードでの送信を開始します。")
+
             frame_id = 0
+            previous_frame = None
+            last_keyframe_time = 0
+            
+            # --- ★ FPS計測用の変数を追加 ---
+            fps_last_time = time.time()
+            fps_frame_count = 0
+            # ---------------------------------
 
             while True:
                 try:
                     img_mss = sct.grab(monitor)
-                    img_np = np.array(img_mss)
-                    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR)
+                    current_frame = cv2.cvtColor(np.array(img_mss), cv2.COLOR_BGRA2BGR)
                     
-                    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
-                    _, encoded_img = cv2.imencode('.jpg', img_bgr, encode_param)
+                    payload = b''
+                    now = time.time()
                     
-                    # --- ★ 暗号化処理 ---
-                    encrypted_data = cipher.encrypt(encoded_img.tobytes())
+                    if previous_frame is None or (now - last_keyframe_time) > KEYFRAME_INTERVAL:
+                        ret, jpeg_data = cv2.imencode('.jpg', current_frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+                        if not ret: continue
+                        payload = struct.pack('>B', TYPE_KEYFRAME) + jpeg_data.tobytes()
+                        last_keyframe_time = now
+                    else:
+                        diff = cv2.absdiff(current_frame, previous_frame)
+                        is_changed = np.any(diff > 15, axis=2)
+                        
+                        changed_y, changed_x = np.where(is_changed)
+                        
+                        if len(changed_y) == 0:
+                            time.sleep(1/60) # 変化がない場合は少し待機
+                            continue
+                        
+                        x, y = np.min(changed_x), np.min(changed_y)
+                        w, h = np.max(changed_x) - x + 1, np.max(changed_y) - y + 1
+                        
+                        cropped_diff = current_frame[y:y+h, x:x+w]
+                        
+                        ret, jpeg_data = cv2.imencode('.jpg', cropped_diff, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+                        if not ret: continue
+                        
+                        header = struct.pack('>BHH', TYPE_DIFF, x, y)
+                        payload = header + jpeg_data.tobytes()
+
+                    encrypted_data = cipher.encrypt(payload)
                     data_size = len(encrypted_data)
-                    # --------------------
-                    
                     total_chunks = (data_size // MAX_CHUNK_SIZE) + 1
                     
                     for i in range(total_chunks):
                         start = i * MAX_CHUNK_SIZE
                         end = start + MAX_CHUNK_SIZE
-                        chunk = encrypted_data[start:end]
-
                         header = struct.pack('QII', frame_id, total_chunks, i)
-                        sock.sendto(header + chunk, (HOST, PORT))
+                        sock.sendto(header + encrypted_data[start:end], (HOST, PORT))
 
-                    frame_id += 1
-                    time.sleep(1/30)
+                    previous_frame = current_frame
+                    frame_id = (frame_id + 1) % 1000000
+                    
+                    # --- ★ FPSを計算して表示 ---
+                    fps_frame_count += 1
+                    if (now - fps_last_time) > 1.0: # 1秒以上経過したら
+                        fps = fps_frame_count / (now - fps_last_time)
+                        print(f"FPS: {fps:.2f}")
+                        # カウンタをリセット
+                        fps_last_time = now
+                        fps_frame_count = 0
+                    # ---------------------------
 
                 except KeyboardInterrupt:
                     print("\n送信を停止しました。")
