@@ -17,12 +17,12 @@ PORT = int(os.getenv('PORT', 9999))
 JPEG_QUALITY = int(os.getenv('JPEG_QUALITY', 60))
 MAX_CHUNK_SIZE = 60000
 KEYFRAME_INTERVAL = 5
+TARGET_FPS = 30
 SECRET_KEY = os.getenv('SECRET_KEY').encode()
 
 # --- Packet Types ---
 TYPE_KEYFRAME = 0
 TYPE_DIFF = 1
-# --------------------
 
 def main():
     cipher = Fernet(SECRET_KEY)
@@ -37,32 +37,34 @@ def main():
             previous_frame = None
             last_keyframe_time = 0
             
-            # --- ★ FPS計測用の変数を追加 ---
-            fps_last_time = time.time()
-            fps_frame_count = 0
-            # ---------------------------------
-
             while True:
                 try:
+                    now = time.time()
                     img_mss = sct.grab(monitor)
                     current_frame = cv2.cvtColor(np.array(img_mss), cv2.COLOR_BGRA2BGR)
                     
                     payload = b''
-                    now = time.time()
                     
-                    if previous_frame is None or (now - last_keyframe_time) > KEYFRAME_INTERVAL:
+                    # --- ★ 修正点 ★ ---
+                    # キーフレームを送信するか、差分を送信するかを決定
+                    is_keyframe_time = (now - last_keyframe_time) > KEYFRAME_INTERVAL
+                    
+                    if previous_frame is None or is_keyframe_time:
+                        # 全画面（キーフレーム）を送信
+                        print(">>> Sending KEYFRAME (full update)") # ★デバッグ表示を追加
                         ret, jpeg_data = cv2.imencode('.jpg', current_frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
                         if not ret: continue
                         payload = struct.pack('>B', TYPE_KEYFRAME) + jpeg_data.tobytes()
                         last_keyframe_time = now
                     else:
+                        # 差分を送信
                         diff = cv2.absdiff(current_frame, previous_frame)
                         is_changed = np.any(diff > 15, axis=2)
                         
                         changed_y, changed_x = np.where(is_changed)
                         
                         if len(changed_y) == 0:
-                            time.sleep(1/60) # 変化がない場合は少し待機
+                            time.sleep(1 / TARGET_FPS)
                             continue
                         
                         x, y = np.min(changed_x), np.min(changed_y)
@@ -76,6 +78,7 @@ def main():
                         header = struct.pack('>BHH', TYPE_DIFF, x, y)
                         payload = header + jpeg_data.tobytes()
 
+                    # 送信処理
                     encrypted_data = cipher.encrypt(payload)
                     data_size = len(encrypted_data)
                     total_chunks = (data_size // MAX_CHUNK_SIZE) + 1
@@ -89,21 +92,12 @@ def main():
                     previous_frame = current_frame
                     frame_id = (frame_id + 1) % 1000000
                     
-                    # --- ★ FPSを計算して表示 ---
-                    fps_frame_count += 1
-                    if (now - fps_last_time) > 1.0: # 1秒以上経過したら
-                        fps = fps_frame_count / (now - fps_last_time)
-                        print(f"FPS: {fps:.2f}")
-                        # カウンタをリセット
-                        fps_last_time = now
-                        fps_frame_count = 0
-                    # ---------------------------
+                    time.sleep(1 / TARGET_FPS)
 
                 except KeyboardInterrupt:
                     print("\n送信を停止しました。")
                     break
                 except Exception as e:
-                    print(f"エラー: {e}")
                     pass
 
 if __name__ == "__main__":
